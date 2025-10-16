@@ -5,22 +5,30 @@
     <meta charset="UTF-8" />
     <title>Idle / Tower Defense Prototype</title>
     <script src="https://cdn.jsdelivr.net/npm/phaser@3/dist/phaser.js"></script>
+    <style>
+        html, body { margin: 0; height: 100%; background-color: #000000;}
+        body { display: flex; align-items: center; justify-content: center; }
+        canvas { display: block; }
+    </style>
 </head>
 
 <body>
     <script>
         const config = {
             type: Phaser.AUTO,
-            width: 800,
-            height: 600,
-            backgroundColor: '#1a1a1a',
+            width: 1280,
+            height: 720,
+            backgroundColor: '#000000',
             physics: { default: 'arcade' },
             scene: { preload, create, update }
         };
 
-        let tower, aura, enemies, spawnTimer = 0, hudText, spawnCount = 0, killCount = 0;
+		let tower, aura, enemies, spawnTimer = 0, hudText, spawnCount = 0, killCount = 0;
+		let spawnIntervalMs = 1000; // start at 1 enemy per second
+		let enemiesPerSpawn = 1; // number of enemies spawned each interval
         let gameOver = false, gameOverText;
 		let baseEnemyHP = 1;
+        let nextEliteSpawn = false; // when true, next enemy spawned is 3x size & HP
         // Perk multipliers and level-up dialog state
         let auraDamageMult = 1.0;
         let auraSizeMult = 1.0;
@@ -31,12 +39,14 @@
         let levelDialogBg, levelDialogPanel, levelDialogHeader, levelDialogChoices = [];
 		const baseAuraRadius = 80;
 		let basePickupRadius = 70; // fixed base, scaled only by pickupSizeMult
+		const HUD_DEPTH = 900;
+		const HUD_BG_DEPTH = 800;
         // Survival timer / time-based scaling
         let survivalTimeMs = 0;
         let timeText;
         let lastHpIncBucket = 0; // increments when floor(time/10s) increases
         // XP / Leveling
-        let level = 1, xp = 0, xpRequired = 20;
+        let level = 1, xp = 0, xpRequired = 10;
 		let xpOrbs, pickupCircle;
 		let xpBarBg, xpBarFill, xpBarText, xpBarFullWidth = 0, xpBarHeight = 16;
 		let statsText;
@@ -44,18 +54,22 @@
         const game = new Phaser.Game(config);
 
 		class Enemy {
-			static spawn(scene, x, y, startingHp, onDeath) {
-				const circle = scene.add.circle(x, y, 10, 0xff0000);
+			static spawn(scene, x, y, startingHp, onDeath, radius = 10, isElite = false) {
+				const circle = scene.add.circle(x, y, radius, 0xff0000);
 				scene.physics.add.existing(circle);
 				circle.body.setCollideWorldBounds(true);
 				circle.maxHealth = startingHp;
 				circle.health = circle.maxHealth;
 				circle.isDead = false;
+				circle.isElite = isElite;
 				circle.hpText = scene.add.text(circle.x, circle.y, String(Math.ceil(circle.health)), {
 					fontFamily: 'monospace',
 					fontSize: '12px',
 					color: '#ffffff'
 				}).setOrigin(0.5).setDepth(5);
+				if (isElite) {
+					circle.crown = createCrown(scene, radius);
+				}
 				circle.damage = function(amount) {
 					if (this.isDead) { return; }
 					this.health -= amount;
@@ -66,6 +80,7 @@
 						this.isDead = true;
 						try { onDeath && onDeath(this); } catch (e) {}
 						if (this.hpText) { this.hpText.destroy(); this.hpText = null; }
+						if (this.crown) { this.crown.destroy(); this.crown = null; }
 						this.destroy();
 					}
 				};
@@ -75,14 +90,14 @@
 		}
 
 		class XpOrb {
-			static spawn(scene, x, y) {
+			static spawn(scene, x, y, value = 1) {
 				const r = Math.random() * 20;
 				const theta = Math.random() * Math.PI * 2;
 				const ox = Math.cos(theta) * r;
 				const oy = Math.sin(theta) * r;
 				const orb = scene.add.circle(x + ox, y + oy, 6, 0xffcc00, 0.9);
 				orb.setStrokeStyle(1, 0xffffff, 1);
-				orb.xpValue = 1;
+				orb.xpValue = value;
 				// bob/scale juice with auto-stop
 				orb.bobTween = scene.tweens.add({ targets: orb, y: orb.y - 6, duration: 600, yoyo: true, repeat: -1, ease: 'sine.inOut' });
 				orb.scaleTween = scene.tweens.add({ targets: orb, scale: 1.15, duration: 700, yoyo: true, repeat: -1, ease: 'sine.inOut' });
@@ -104,7 +119,7 @@
 
         function create() {
             // tower in the center
-            tower = this.add.circle(400, 300, 20, 0x00ff00);
+            tower = this.add.circle(640, 360, 20, 0x00ff00);
             this.physics.add.existing(tower);
             tower.body.setImmovable(true);
             // tower health
@@ -136,61 +151,76 @@
             pickupCircle = this.add.circle(tower.x, tower.y, pickupRadius, 0x3399ff, 0.08);
             pickupCircle.setStrokeStyle(1, 0x3399ff, 0.4);
 
-            // HUD counters
-            hudText = this.add.text(10, 10, 'Spawned: 0   Killed: 0', {
+			// HUD counters (moved to stats; hide legacy HUD text)
+			hudText = this.add.text(10, 10, 'Spawned: 0   Killed: 0', {
                 fontFamily: 'monospace',
                 fontSize: '16px',
                 color: '#ffffff'
-            });
+			}).setDepth(HUD_DEPTH).setVisible(false);
 
-		// Survival timer in top-right
-            timeText = this.add.text(this.scale.width - 10, 10, '00:00', {
-                fontFamily: 'monospace',
-                fontSize: '16px',
-                color: '#ffffff',
-                align: 'right'
-            }).setOrigin(1, 0);
+			// speed controls removed
+
+		// Survival timer in upper-left (larger)
+		timeText = this.add.text(10, 10, '00:00', {
+			fontFamily: 'monospace',
+			fontSize: '32px',
+			color: '#ffffff',
+			align: 'left'
+		}).setOrigin(0, 0).setDepth(HUD_DEPTH);
 
 		// Stats panel (right side under timer)
-		statsText = this.add.text(this.scale.width - 10, 32, '', {
+		statsText = this.add.text(1270, 32, '', {
 			fontFamily: 'monospace',
 			fontSize: '12px',
 			color: '#cccccc',
 			align: 'right'
-		}).setOrigin(1, 0);
+		}).setOrigin(1, 0).setDepth(HUD_DEPTH);
 
             // XP progress bar UI at bottom
             const margin = 20;
-            const barY = this.scale.height - margin;
-            xpBarFullWidth = this.scale.width - (margin * 2);
-            xpBarBg = this.add.rectangle(margin, barY, xpBarFullWidth, xpBarHeight, 0x333333).setOrigin(0, 0.5);
-            xpBarFill = this.add.rectangle(margin, barY, xpBarFullWidth, xpBarHeight, 0x88ff88).setOrigin(0, 0.5);
+            const barY = 720 - margin;
+            xpBarFullWidth = 1280 - (margin * 2);
+			xpBarBg = this.add.rectangle(margin, barY, xpBarFullWidth, xpBarHeight, 0x333333).setOrigin(0, 0.5).setDepth(HUD_BG_DEPTH);
+			xpBarFill = this.add.rectangle(margin, barY, xpBarFullWidth, xpBarHeight, 0x88ff88).setOrigin(0, 0.5).setDepth(HUD_BG_DEPTH + 1);
             xpBarFill.setDisplaySize(0, xpBarHeight);
-            xpBarText = this.add.text(margin, barY - 24, '', {
+			xpBarText = this.add.text(margin, barY - 24, '', {
                 fontFamily: 'monospace',
                 fontSize: '14px',
                 color: '#ffffff'
-            }).setOrigin(0, 0.5);
+			}).setOrigin(0, 0.5).setDepth(HUD_DEPTH);
             refreshXpUi();
 
             // Per-tick tower contact damage handled in update()
         }
 
-        function spawnEnemy(scene) {
+		function spawnEnemy(scene) {
             // random edge spawn
             const side = Phaser.Math.Between(0, 3);
             let x, y;
-            if (side === 0) { x = 0; y = Phaser.Math.Between(0, 600); }
-            else if (side === 1) { x = 800; y = Phaser.Math.Between(0, 600); }
-            else if (side === 2) { x = Phaser.Math.Between(0, 800); y = 0; }
-            else { x = Phaser.Math.Between(0, 800); y = 600; }
+            const w = scene.scale.width;
+            const h = scene.scale.height;
+            if (side === 0) { x = 0; y = Phaser.Math.Between(0, 720); }
+            else if (side === 1) { x = 1280; y = Phaser.Math.Between(0, 720); }
+            else if (side === 2) { x = Phaser.Math.Between(0, 1280); y = 0; }
+            else { x = Phaser.Math.Between(0, 1280); y = 720; }
 
-            const enemy = Enemy.spawn(scene, x, y, baseEnemyHP, (deadEnemy) => {
+			// determine if this spawn should be elite (3x size and HP)
+			const isElite = nextEliteSpawn === true;
+			const spawnHp = isElite ? (baseEnemyHP * 3) : baseEnemyHP;
+			const spawnRadius = isElite ? 30 : 10;
+
+			const enemy = Enemy.spawn(scene, x, y, spawnHp, (deadEnemy) => {
                 killCount++;
+				// schedule next enemy as elite every 20 kills
+				if (killCount % 20 === 0) {
+					nextEliteSpawn = true;
+				}
                 // spawn XP orb (value 1)
-                spawnXpOrb(scene, deadEnemy.x, deadEnemy.y);
+				spawnXpOrb(scene, deadEnemy.x, deadEnemy.y, isElite ? 3 : 1);
                 refreshHud();
-            });
+			}, spawnRadius, isElite);
+			// consume elite flag if used
+			if (isElite) { nextEliteSpawn = false; }
             enemies.add(enemy);
             spawnCount++;
             refreshHud();
@@ -206,30 +236,45 @@
                 const ss = String(totalSeconds % 60).padStart(2, '0');
                 if (timeText) { timeText.setText(mm + ':' + ss); }
 
-                // time-based enemy HP scaling: +1 every 10 seconds
-                const bucket = Math.floor(totalSeconds / 10);
-                if (bucket > lastHpIncBucket) {
-                    baseEnemyHP += (bucket - lastHpIncBucket);
-                    lastHpIncBucket = bucket;
-		}
+				// time-based scaling buckets: every 20s (hp and spawn speed)
+				const bucket = Math.floor(totalSeconds / 20);
+				if (bucket > lastHpIncBucket) {
+					const diff = bucket - lastHpIncBucket;
+					// increase enemy HP by +1 per bucket
+					baseEnemyHP += diff;
+					// decrease spawn interval by 5% per bucket (faster spawns), clamp to >= 100ms
+					spawnIntervalMs = Math.max(100, spawnIntervalMs * Math.pow(0.95, diff));
+					lastHpIncBucket = bucket;
+				}
+
+				// enemies per spawn increases every 30s
+				if (typeof lastSpawnBatchBucket === 'undefined') { lastSpawnBatchBucket = 0; }
+				const batchBucket = Math.floor(totalSeconds / 30);
+				if (batchBucket > lastSpawnBatchBucket) {
+					enemiesPerSpawn += (batchBucket - lastSpawnBatchBucket);
+					lastSpawnBatchBucket = batchBucket;
+				}
 
 		// update stats panel each frame
 		refreshStatsUi();
             }
-            if (!gameOver && !pausedForLevelUp && spawnTimer > 1000) { // spawn every 1 s
-                spawnEnemy(this);
+		if (!gameOver && !pausedForLevelUp && spawnTimer > spawnIntervalMs) { // dynamic spawn interval
+				for (let i = 0; i < (typeof enemiesPerSpawn === 'number' ? enemiesPerSpawn : 1); i++) {
+					spawnEnemy(this);
+				}
                 spawnTimer = 0;
             }
 
             enemies.getChildren().forEach(e => {
                 if (!gameOver && !pausedForLevelUp) {
-                const angle = Phaser.Math.Angle.Between(e.x, e.y, 400, 300);
+                const angle = Phaser.Math.Angle.Between(e.x, e.y, 640, 360);
                 const speed = 60;
                 e.body.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
                 } else {
                     if (e && e.body) { e.body.setVelocity(0, 0); }
                 }
                 if (e.hpText) { e.hpText.setPosition(e.x, e.y); }
+                if (e.crown) { e.crown.setPosition(e.x, e.y); }
             });
 
 		// keep tower HP text and pickup circle centered on tower (in case we animate/move tower later)
@@ -427,16 +472,22 @@
         function refreshStatsUi() {
             if (!statsText) { return; }
             const lines = [
+                'Spawned: ' + spawnCount,
+                'Killed: ' + killCount,
                 'Aura Dmg: x' + auraDamageMult.toFixed(2),
                 'Aura Size: x' + auraSizeMult.toFixed(2),
                 'Pickup Size: x' + pickupSizeMult.toFixed(2),
-                'XP Gain: x' + xpGainMult.toFixed(2)
+                'XP Gain: x' + xpGainMult.toFixed(2),
+                'Spawn: ' + Math.round(spawnIntervalMs) + 'ms (' + (1000 / spawnIntervalMs).toFixed(2) + '/s)',
+                'Enemy HP: ' + baseEnemyHP,
+                'Batch: ' + (typeof enemiesPerSpawn === 'number' ? enemiesPerSpawn : 1)
             ];
             statsText.setText(lines.join('\n'));
         }
+        
 
-        function spawnXpOrb(scene, x, y) {
-            const orb = XpOrb.spawn(scene, x, y);
+		function spawnXpOrb(scene, x, y, value = 1) {
+			const orb = XpOrb.spawn(scene, x, y, value);
             xpOrbs.add(orb);
         }
 
@@ -461,6 +512,39 @@
                     onComplete: () => p.destroy()
                 });
             }
+        }
+
+        function createCrown(scene, enemyRadius) {
+            // crown with base and three distinct spikes
+            const crownHeight = Math.max(6, Math.floor(enemyRadius * 0.8));
+            const crownWidth = Math.max(14, Math.floor(enemyRadius * 1.4));
+            const g = scene.add.graphics();
+            g.fillStyle(0xffd700, 1);
+            g.lineStyle(1, 0xffffff, 1);
+            const halfW = crownWidth / 2;
+            const baseY = -enemyRadius - 2;
+            const baseH = Math.max(3, Math.floor(crownHeight * 0.3));
+            // draw base
+            g.fillRect(-halfW, baseY, crownWidth, baseH);
+            g.strokeRect(-halfW, baseY, crownWidth, baseH);
+            // spike helper
+            const drawSpike = (cx, width, height) => {
+                g.beginPath();
+                g.moveTo(cx - width / 2, baseY);
+                g.lineTo(cx, baseY - height);
+                g.lineTo(cx + width / 2, baseY);
+                g.closePath();
+                g.fillPath();
+                g.strokePath();
+            };
+            const segment = crownWidth / 3;
+            const spikeW = segment * 0.7;
+            // three spikes: left, middle, right
+            drawSpike(-halfW + segment * 0.5, spikeW, crownHeight * 0.8); // left
+            drawSpike(0, spikeW, crownHeight); // middle (tallest)
+            drawSpike(halfW - segment * 0.5, spikeW, crownHeight * 0.8); // right
+            g.setDepth(50);
+            return g;
         }
     </script>
 </body>
